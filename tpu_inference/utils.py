@@ -144,9 +144,15 @@ def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
                     e)
     else:
         for device in devices:
-            hbm_used = device.memory_stats()["bytes_in_use"]
-            hbm_limit = device.memory_stats()["bytes_limit"]
-            usage.append((hbm_used, hbm_limit))
+            stats = device.memory_stats()
+            if stats is None:
+                # Default to a fake value for CPU/Mac environments where memory_stats is unavailable
+                usage.append((0, 32 * GBYTES))
+            else:
+                hbm_used = stats["bytes_in_use"]
+                hbm_limit = stats["bytes_limit"]
+                usage.append((hbm_used, hbm_limit))
+
 
     return usage
 
@@ -246,8 +252,13 @@ def make_optimized_mesh(axis_shapes: Sequence[int],
                         devices: Sequence[xc.Device] | None = None):
     if devices is None:
         devices = xb.devices()
-    # Sort the devices in case it's passed in an arbitary order
-    devices = sorted(devices, key=lambda x: x.coords)
+    # Sort the devices in case it's passed in an arbitrary order.
+    # On CPU, devices may not have 'coords', so we skip sorting.
+    try:
+        devices = sorted(devices, key=lambda x: x.coords)
+    except AttributeError:
+        logger.debug("Devices do not have 'coords' attribute (likely on CPU). Skipping sorting in make_optimized_mesh.")
+
 
     def _is_1D(axis_shapes):
         return sum(x > 1 for x in axis_shapes) == 1

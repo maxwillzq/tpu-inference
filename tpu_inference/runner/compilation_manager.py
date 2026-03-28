@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import time
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import vllm.envs as vllm_envs
+from jax.experimental import topologies
 from jax.sharding import NamedSharding, PartitionSpec
+import vllm.envs as vllm_envs
 
 import tpu_inference.envs as envs
 from tpu_inference.core.disagg_utils import is_disagg_enabled
@@ -162,6 +165,8 @@ class CompilationManager:
                                     intermediate_tensors=None,
                                     is_first_rank=True,
                                     is_last_rank=True) -> None:
+        from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+
         num_tokens = None
         if input_ids is not None:
             num_tokens = input_ids.shape[0]
@@ -242,22 +247,167 @@ class CompilationManager:
                 self.runner.lora_config, np.array([num_tokens],
                                                   dtype=np.int32)):
             lora_metadata = self.runner.lora_utils.extract_lora_metadata()
-            self._run_compilation(
-                name,
-                model_fn_wrapper,
-                self.runner.state,
-                self.runner.kv_caches,
-                input_ids,
-                attention_metadata,
-                positions,
-                inputs_embeds,
-                tuple(self.runner.layer_name_to_kvcache_index.items()),
-                lora_metadata,
-                intermediate_tensors,
-                is_first_rank,
-                is_last_rank,
-                num_tokens=num_tokens,
-            )
+            
+            topology_name = os.environ.get("GOOGLE_EXPORT_TOPOLOGY", "vlp_1x1")
+            if jax.devices()[0].device_kind == 'cpu':
+                logger.info(f"Running on CPU, bypassing get_topology_desc. Using {len(jax.devices())} local devices (controlled by XLA_FLAGS).")
+                devices = jax.devices()
+            else:
+                topology_desc = topologies.get_topology_desc(topology_name)
+                devices = topology_desc.devices
+
+            try:
+                devices_array = np.array(devices).reshape(self.runner.mesh.devices.shape)
+            except ValueError:
+                sharding_strategy = self.runner.vllm_config.sharding_config
+                mesh_shape = (
+                    sharding_strategy.model_dp_size,
+                    sharding_strategy.attn_dp_size,
+                    sharding_strategy.attn_dp_expert_size,
+                    sharding_strategy.expert_size,
+                    sharding_strategy.tp_size,
+                )
+                devices_array = np.array(devices).reshape(mesh_shape)
+                
+            simulated_mesh = jax.sharding.Mesh(devices_array, self.runner.mesh.axis_names)
+
+            with jax.set_mesh(simulated_mesh):
+                export_path = os.environ.get("GOOGLE_EXPORT_MODEL_PATH")
+                if export_path:
+                    from flax import nnx
+                    is_variable = lambda x: isinstance(x, nnx.Variable)
+
+                    def prepare_export_state(pytree):
+                        if hasattr(pytree, 'items'):
+                            new_dict = {}
+                            recon_dict = {}
+                            for k, v in pytree.items():
+                                string_k = str(k)
+                                new_v, recon_v = prepare_export_state(v)
+                                new_dict[string_k] = new_v
+                                recon_dict[string_k] = (k, recon_v)
+                            return new_dict, recon_dict
+                        elif isinstance(pytree, (list, tuple)):
+                            res = [prepare_export_state(v) for v in pytree]
+                            return type(pytree)(p[0] for p in res), type(pytree)(p[1] for p in res)
+                        elif is_variable(pytree):
+                            return pytree.value, type(pytree)
+                        else:
+                            return pytree, None
+
+                    def reconstruct_state_fn(stringified_state, recon_tree):
+                        if isinstance(recon_tree, dict):
+                            new_dict = {}
+                            for string_k, (original_k, recon_v) in recon_tree.items():
+                                new_dict[original_k] = reconstruct_state_fn(stringified_state[string_k], recon_v)
+                            return nnx.State(new_dict)
+                        elif isinstance(recon_tree, (list, tuple)):
+                            return type(recon_tree)(reconstruct_state_fn(s, r) for s, r in zip(stringified_state, recon_tree))
+                        else:
+                            if recon_tree is not None and issubclass(recon_tree, nnx.Variable):
+                                return recon_tree(stringified_state)
+                            else:
+                                return stringified_state
+
+                    pure_state, recon_tree = prepare_export_state(self.runner.state)
+
+                    def attention_metadata_to_dict(attn):
+                        if isinstance(attn, dict):
+                            return {k: attention_metadata_to_dict(v) for k, v in attn.items()}
+                        elif isinstance(attn, AttentionMetadata):
+                            return {
+                                "input_positions": attn.input_positions,
+                                "block_tables": attn.block_tables,
+                                "seq_lens": attn.seq_lens,
+                                "query_start_loc": attn.query_start_loc,
+                                "request_distribution": attn.request_distribution,
+                            }
+                        else:
+                            return attn
+
+                    is_single_attn = len(self.runner.kv_cache_config.kv_cache_groups) <= 1
+                    export_attention_metadata = attention_metadata_to_dict(attention_metadata)
+
+                    def export_wrapper(
+                        pure_state, kv_caches, input_ids, export_attention_metadata, inputs_embeds,
+                        positions, layer_name_to_kvcache_index, lora_metadata,
+                        intermediate_tensors, is_first_rank, is_last_rank):
+                        
+                        state = reconstruct_state_fn(pure_state, recon_tree)
+                        if is_single_attn:
+                            attention_metadata = AttentionMetadata(**export_attention_metadata)
+                        else:
+                            attention_metadata = {k: AttentionMetadata(**v) for k, v in export_attention_metadata.items()}
+                        return model_fn_wrapper(state, kv_caches, input_ids, attention_metadata, positions, inputs_embeds, layer_name_to_kvcache_index, lora_metadata, intermediate_tensors, is_first_rank, is_last_rank)
+
+                    if jax.devices()[0].device_kind == 'cpu':
+                        from jax._src.pallas.mosaic import tpu_info as pltpu
+                        from jax._src.pallas.mosaic.tpu_info import TpuInfo, ChipVersion
+                        
+                        def mock_tpu_info():
+                            return TpuInfo(
+                                chip_version=ChipVersion.TPU_V5E,
+                                generation=5,
+                                num_cores=1,
+                                num_lanes=128,
+                                num_sublanes=8,
+                                mxu_column_size=128,
+                                vmem_capacity_bytes=128 * 1024 * 1024,
+                                cmem_capacity_bytes=0,
+                                smem_capacity_bytes=1024 * 1024,
+                                hbm_capacity_bytes=17_200_000_000,
+                                mem_bw_bytes_per_second=int(8.20e11),
+                                bf16_ops_per_second=int(1.97e14),
+                                int8_ops_per_second=int(3.94e14),
+                                fp8_ops_per_second=0,
+                                int4_ops_per_second=int(7.88e14),
+                            )
+                        
+                        pltpu.registry['cpu'] = mock_tpu_info
+
+                    if not os.path.exists(export_path):
+                        os.makedirs(export_path)
+                    
+                    target_file = os.path.join(export_path, "model_fn", f"{name}.bin")
+                    if not os.path.exists(target_file):
+                        from jax import export as jax_export
+                        from tpu_inference.serving_model import save_native_model
+                        
+                        exp = jax_export.export(jax.jit(export_wrapper, static_argnums=(6, 7, 8, 9, 10)), platforms=["tpu"])(
+                            pure_state,
+                            self.runner.kv_caches,
+                            input_ids,
+                            export_attention_metadata,
+                            inputs_embeds,
+                            positions,
+                            tuple(self.runner.layer_name_to_kvcache_index.items()),
+                            lora_metadata,
+                            intermediate_tensors,
+                            is_first_rank,
+                            is_last_rank,
+                        )
+                        save_native_model(export_path, {name: exp})
+                        logger.info(f"Exported {name} to {export_path}")
+                    else:
+                        logger.info(f"Skipping export for {name}, file already exists.")
+                    raise RuntimeError("Export complete check bypass")
+                else:
+                    self._run_compilation(
+                        name,
+                        model_fn_wrapper,
+                        self.runner.state,
+                        self.runner.kv_caches,
+                        input_ids,
+                        attention_metadata,
+                        positions,
+                        inputs_embeds,
+                        tuple(self.runner.layer_name_to_kvcache_index.items()),
+                        lora_metadata,
+                        intermediate_tensors,
+                        is_first_rank,
+                        is_last_rank,
+                        num_tokens=num_tokens,
+                    )
 
     def _precompile_substitute_placeholder_token(self) -> None:
         """Precompiles the token substitution function for all expected input shapes.
@@ -332,7 +482,7 @@ class CompilationManager:
                         "residual": residual
                     })
             self._precompile_backbone_helper(
-                f"worker{self.runner.rank} backbone",
+                "model_fn",
                 input_ids=input_ids,
                 positions=positions,
                 inputs_embeds=None,

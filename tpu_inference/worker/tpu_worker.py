@@ -22,10 +22,10 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from tpu_inference import envs, utils
-from tpu_inference.distributed import jax_parallel_state
-from tpu_inference.distributed.jax_parallel_state import get_pp_group
+
 from tpu_inference.distributed.utils import (get_device_topology_order_id,
                                              get_host_ip, get_kv_transfer_port)
+
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
@@ -33,6 +33,15 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 logger = init_logger(__name__)
+
+try:
+    from tpu_inference.distributed import jax_parallel_state
+    from tpu_inference.distributed.jax_parallel_state import get_pp_group
+except (ImportError, AttributeError) as e:
+    logger.warning(f"Failed to import jax_parallel_state: {e}. Distributed features may be disabled.")
+    jax_parallel_state = None
+    get_pp_group = None
+
 
 
 @dataclass
@@ -278,12 +287,16 @@ class TPUWorker(WorkerBase):
                 pipeline_model_parallel_size=1,
             )
 
-        jax_parallel_state.init_pp_distributed_environment(
-            self.pp_config.ip,
-            self.rank,
-            self.parallel_config.pipeline_parallel_size,
-            self.devices[0],
-            need_pp=self.parallel_config.pipeline_parallel_size > 1)
+        if jax_parallel_state is not None:
+            jax_parallel_state.init_pp_distributed_environment(
+                self.pp_config.ip,
+                self.rank,
+                self.parallel_config.pipeline_parallel_size,
+                self.devices[0] if self.devices else None,
+                need_pp=self.parallel_config.pipeline_parallel_size > 1)
+        else:
+            logger.warning("Skipping init_pp_distributed_environment because jax_parallel_state is not available.")
+
 
         ensure_kv_transfer_initialized(self.vllm_config)
 
