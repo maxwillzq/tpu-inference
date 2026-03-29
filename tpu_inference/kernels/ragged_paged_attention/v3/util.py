@@ -51,6 +51,9 @@ def next_power_of_2(x: int):
 
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
+    import os
+    if "VLLM_TPU_VERSION_OVERRIDE" in os.environ:
+        return int(os.environ["VLLM_TPU_VERSION_OVERRIDE"])
     kind = jax.devices()[0].device_kind
     if 'TPU' not in kind:
         return -1
