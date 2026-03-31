@@ -286,20 +286,25 @@ def get_flax_model(
     # https://flax.readthedocs.io/en/latest/guides/performance.html
     graphdef, state = nnx.split(jit_model)
 
-    @jax.jit(
-        out_shardings=(
-            kv_cache_sharding,
-            hidden_states_sharding,
-            hidden_states_sharding,  # aux hidden states
-        ),
-        donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
-        static_argnums=(
-            7, 10, 11
-        ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
-    )
-    def run_model(graphdef, state, *args):
+    def run_model_def(graphdef, state, *args):
         model = nnx.merge(graphdef, state)
         return model(*args)
+
+    if os.environ.get("GOOGLE_EXPORT_MODEL_PATH"):
+        run_model = run_model_def
+    else:
+        run_model = jax.jit(
+            run_model_def,
+            out_shardings=(
+                kv_cache_sharding,
+                hidden_states_sharding,
+                hidden_states_sharding,  # aux hidden states
+            ),
+            donate_argnums=2,  # 0 is graphdef, 1 is state, 2 is kv_cache
+            static_argnums=(
+                7, 10, 11
+            ),  #7 is layer_name_to_kvcache_index, 10 is is_first_rank, 11 is is_last_rank
+        )
 
     logits_sharding = NamedSharding(
         mesh,

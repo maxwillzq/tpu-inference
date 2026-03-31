@@ -14,6 +14,7 @@
 
 import functools
 import math
+import os
 from typing import Any, Callable, Optional, Tuple
 
 import jax
@@ -39,6 +40,11 @@ from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_megacore
 
 logger = init_logger(__name__)
+
+
+def _get_export_mesh(mesh):
+    return mesh
+
 
 MAX_ALLOWED_PAGE_INDICES_N = (
     128 * 1024
@@ -68,6 +74,7 @@ def sharded_flash_attention(
     vmem_limit_bytes: int | None = None,
     use_attention_bias: bool = False,
 ) -> Callable[..., Any]:
+    mesh = _get_export_mesh(mesh)
     if use_attention_bias:
         in_specs = (
             P("data", "model", None, None),  # q
@@ -109,9 +116,10 @@ def sharded_flash_attention(
 
         attn_fn = _flash_attention
 
+    export_mesh = None if os.environ.get("GOOGLE_EXPORT_MODEL_PATH") else mesh
     return jax.jit(
         jax.shard_map(attn_fn,
-                      mesh=mesh,
+                      mesh=export_mesh,
                       in_specs=in_specs,
                       out_specs=out_specs,
                       check_vma=False))
@@ -122,6 +130,7 @@ def sharded_paged_attention(
     attn_logits_soft_cap: Optional[float] = None,
 ) -> Callable[..., Any]:
     """Shards GQA PagedAttention along KV heads."""
+    mesh = _get_export_mesh(mesh)
     in_specs = (
         P(None, "model", None),  # q
         P("model", None, None, None),  # k
@@ -148,10 +157,11 @@ def sharded_paged_attention(
             megacore_mode="kv_head" if get_megacore() else None,
         )
 
+    export_mesh = None if os.environ.get("GOOGLE_EXPORT_MODEL_PATH") else mesh
     return jax.jit(
         jax.shard_map(
             _paged_attention_fn,
-            mesh=mesh,
+            mesh=export_mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,
@@ -304,6 +314,7 @@ def sharded_splash_attention(
     attn_logits_soft_cap: Optional[float] = None,
     is_mqa: bool = False,
 ) -> Callable[..., Any]:
+    mesh = _get_export_mesh(mesh)
     in_specs = (
         P("data", "model", None, None),  # q
         P("data", "model", None, None),  # k
@@ -343,6 +354,7 @@ def sharded_ragged_paged_attention(
     v_scale: float | None = None,
 ):
     """Shards along KV heads."""
+    mesh = _get_export_mesh(mesh)
     # Handle GQA/MQA where num_kv_heads < tp_size
     # We replicate KV heads to match tp_size so that we can shard them evenly.
     # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
@@ -396,9 +408,10 @@ def sharded_ragged_paged_attention(
             v_scale=v_scale,
         )
 
+    export_mesh = None if os.environ.get("GOOGLE_EXPORT_MODEL_PATH") else mesh
     return jax.shard_map(
         _ragged_paged_attention,
-        mesh=mesh,
+        mesh=export_mesh,
         in_specs=in_specs,
         out_specs=out_specs,
         check_vma=False,
@@ -501,6 +514,7 @@ def mla_attention(
         v_scale: scale to apply to v (if quantized)
         sm_scale: softmax scale
     """
+    mesh = _get_export_mesh(mesh)
     in_specs = (
         query_tnh_sharding or P(ShardingAxisName.MLP_TENSOR, None, None),  # q
         query_tnh_sharding

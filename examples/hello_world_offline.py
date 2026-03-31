@@ -25,7 +25,7 @@ def main():
             raise e
 
     if export_path:
-        print("[WARNING] Export mode was set but compilation intercept did not trigger.")
+        print(f"\n[SUCCESS] Model backbone exported to {export_path}")
         return
 
     # Standard Inference

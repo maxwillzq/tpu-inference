@@ -81,6 +81,10 @@ class CompilationManager:
 
     def _run_compilation(self, name: str, fn: Callable, *args,
                          **kwargs) -> None:
+        if os.environ.get("GOOGLE_EXPORT_MODEL_PATH"):
+            logger.info("Skipping actual compilation in export mode")
+            return
+
         logger.info(f"Precompile {name} --> {kwargs}")
         start = time.perf_counter()
         result = fn(*args)
@@ -249,15 +253,13 @@ class CompilationManager:
             lora_metadata = self.runner.lora_utils.extract_lora_metadata()
             
             topology_name = os.environ.get("GOOGLE_EXPORT_TOPOLOGY", "vlp_1x1")
-            if jax.devices()[0].device_kind == 'cpu':
-                logger.info(f"Running on CPU, bypassing get_topology_desc. Using {len(jax.devices())} local devices (controlled by XLA_FLAGS).")
-                devices = jax.devices()
-            else:
-                topology_desc = topologies.get_topology_desc(topology_name)
-                devices = topology_desc.devices
+            topology_desc = topologies.get_topology_desc(topology_name)
+            devices = topology_desc.devices
 
             try:
-                devices_array = np.array(devices).reshape(self.runner.mesh.devices.shape)
+                target_shape = self.runner.mesh.devices.shape
+                num_required = np.prod(target_shape)
+                devices_array = np.array(devices[:num_required]).reshape(target_shape)
             except ValueError:
                 sharding_strategy = self.runner.vllm_config.sharding_config
                 mesh_shape = (
@@ -267,7 +269,8 @@ class CompilationManager:
                     sharding_strategy.expert_size,
                     sharding_strategy.tp_size,
                 )
-                devices_array = np.array(devices).reshape(mesh_shape)
+                num_required = np.prod(mesh_shape)
+                devices_array = np.array(devices[:num_required]).reshape(mesh_shape)
                 
             simulated_mesh = jax.sharding.Mesh(devices_array, self.runner.mesh.axis_names)
 
@@ -373,24 +376,36 @@ class CompilationManager:
                         from jax import export as jax_export
                         from tpu_inference.serving_model import save_native_model
                         
+                        def to_abstract(x):
+                            if hasattr(x, "shape") and hasattr(x, "dtype"):
+                                return jax.ShapeDtypeStruct(x.shape, x.dtype)
+                            return x
+
+                        abstract_pure_state = jax.tree.map(to_abstract, pure_state)
+                        abstract_kv_caches = jax.tree.map(to_abstract, self.runner.kv_caches)
+                        abstract_input_ids = jax.tree.map(to_abstract, input_ids)
+                        abstract_attention_metadata = jax.tree.map(to_abstract, export_attention_metadata)
+                        abstract_inputs_embeds = jax.tree.map(to_abstract, inputs_embeds)
+                        abstract_positions = jax.tree.map(to_abstract, positions)
+
                         exp = jax_export.export(jax.jit(export_wrapper, static_argnums=(6, 7, 8, 9, 10)), platforms=["tpu"])(
-                            pure_state,
-                            self.runner.kv_caches,
-                            input_ids,
-                            export_attention_metadata,
-                            inputs_embeds,
-                            positions,
+                            abstract_pure_state,
+                            abstract_kv_caches,
+                            abstract_input_ids,
+                            abstract_attention_metadata,
+                            abstract_inputs_embeds,
+                            abstract_positions,
                             tuple(self.runner.layer_name_to_kvcache_index.items()),
                             lora_metadata,
                             intermediate_tensors,
                             is_first_rank,
                             is_last_rank,
                         )
+
                         save_native_model(export_path, {name: exp})
                         logger.info(f"Exported {name} to {export_path}")
                     else:
                         logger.info(f"Skipping export for {name}, file already exists.")
-                    raise RuntimeError("Export complete check bypass")
                 else:
                     self._run_compilation(
                         name,
